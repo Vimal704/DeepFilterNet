@@ -9,12 +9,13 @@ import numpy as np
 import torch
 import torchaudio
 from loguru import logger
-from torch import Tensor, nn, optim
+from torch import Tensor, from_numpy, nn, optim
 from torch.autograd.anomaly_mode import set_detect_anomaly
 from torch.autograd.grad_mode import set_grad_enabled
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.types import Number
 
+from spp_modified import *
 from df.checkpoint import check_patience, load_model, read_cp, write_cp
 from df.config import Csv, config
 from df.logger import init_logger, log_metrics, log_model_summary
@@ -163,7 +164,6 @@ def main():
         log_timings=log_timings,
         global_sampling_factor=config("GLOBAL_DS_SAMPLING_F", 1.0, float, section="train"),
         snrs=config("DATALOADER_SNRS", [-5, 0, 5, 10, 20, 40], Csv(int), section="train"),  # type: ignore
-        gains=config("DATALOADER_GAINS", [-6, 0, 6], Csv(int), section="train"),  # type: ignore
         log_level=log_level,
     )
 
@@ -365,6 +365,17 @@ def run_epoch(
         feat_erb = batch.feat_erb.to(dev, non_blocking=True)
         feat_spec = as_real(batch.feat_spec.to(dev, non_blocking=True))
         noisy = batch.noisy.to(dev, non_blocking=True)
+        #if i==0:
+         # torch.save(noisy,'tensor.pt')
+          #noisy_mag = torch.abs(torch.squeeze(noisy))
+          #ns_ps = noisy_mag[0,:] ** 2
+          #plt.figure(figsize=(20,10))
+          #frequency = torch.linspace(0,48000,len(ns_ps))
+          #plt.plot(frequency,ns_ps)
+          
+        spp1 = literature_noise_estimation_wrapper(noisy)
+        # print("=======//////======",noisy.shape)
+        # print("=======//////======",spp1.shape)
         clean = batch.speech.to(dev, non_blocking=True)
         snrs = batch.snr.to(dev, non_blocking=True)
         with set_detect_anomaly(detect_anomaly and is_train), set_grad_enabled(is_train):
@@ -372,10 +383,12 @@ def run_epoch(
                 input = as_real(noisy).clone()
             else:
                 input = as_real(noisy)
+            # print(input.shape)
             enh, m, lsnr, other = model.forward(
                 spec=input,
                 feat_erb=feat_erb,
                 feat_spec=feat_spec,
+                spp = spp1.to(device=get_device()),
             )
             try:
                 err = losses.forward(clean, noisy, enh, m, lsnr, snrs=snrs)
@@ -410,7 +423,7 @@ def run_epoch(
                                 prefix=split + f"_e{epoch}_i{i}_b{batch_idx}_ds{clean_idx}",
                                 idx=batch_idx,
                             )
-                        cleanup(err, noisy, clean, enh, m, feat_erb, feat_spec, batch)
+                        cleanup(err, noisy, clean, enh, m, feat_erb, feat_spec, batch,spp1)
                         n_nans += 1
                         if n_nans > MAX_NANS:
                             raise e

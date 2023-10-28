@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Final, List, Optional, Tuple
 
+import numpy as np
 import torch
 from loguru import logger
 from torch import Tensor, nn
@@ -8,6 +9,7 @@ from torch import Tensor, nn
 import df.multiframe as MF
 from df.config import Csv, DfParams, config
 from df.modules import (
+    Conv1dNormAct,             #added 1d layer
     Conv2dNormAct,
     ConvTranspose2dNormAct,
     GroupedLinearEinsum,
@@ -16,11 +18,8 @@ from df.modules import (
     erb_fb,
     get_device,
 )
-from df.utils import as_complex
 from libdf import DF
-
-PI = 3.1415926535897932384626433
-
+spp_shape=[]
 
 class ModelParams(DfParams):
     section = "deepfilternet"
@@ -52,9 +51,6 @@ class ModelParams(DfParams):
         self.emb_num_layers: int = config(
             "EMB_NUM_LAYERS", cast=int, default=2, section=self.section
         )
-        self.emb_gru_skip_enc: str = config(
-            "EMB_GRU_SKIP_ENC", default="none", section=self.section
-        )
         self.emb_gru_skip: str = config("EMB_GRU_SKIP", default="none", section=self.section)
         self.df_hidden_dim: int = config(
             "DF_HIDDEN_DIM", cast=int, default=256, section=self.section
@@ -71,7 +67,6 @@ class ModelParams(DfParams):
             "ENC_LINEAR_GROUPS", cast=int, default=16, section=self.section
         )
         self.mask_pf: bool = config("MASK_PF", cast=bool, default=False, section=self.section)
-        self.pf_beta: float = config("PF_BETA", cast=float, default=0.02, section=self.section)
         self.lsnr_dropout: bool = config(
             "LSNR_DROPOUT", cast=bool, default=False, section=self.section
         )
@@ -88,13 +83,13 @@ def init_model(df_state: Optional[DF] = None, run_df: bool = True, train_mask: b
 
 
 class Add(nn.Module):
-    def forward(self, a, b):
-        return a + b
+    def forward(self, a, b, c):
+        return a + b + c
 
 
 class Concat(nn.Module):
-    def forward(self, a, b):
-        return torch.cat((a, b), dim=-1)
+    def forward(self, a, b, c):
+        return torch.cat((a, b, c), dim=-1)
 
 
 class Encoder(nn.Module):
@@ -102,6 +97,11 @@ class Encoder(nn.Module):
         super().__init__()
         p = ModelParams()
         assert p.nb_erb % 4 == 0, "erb_bins should be divisible by 4"
+        global spp_shape
+        #-------- 2D convlution added(although in modules it named 1dNormAct)-------
+        self.conv1d = Conv1dNormAct(
+           in_channels= 1,out_channels=1,kernel_size=(1,6),stride=(1,5)
+        )
 
         self.erb_conv0 = Conv2dNormAct(
             1, p.conv_ch, kernel_size=p.conv_kernel_inp, bias=False, separable=True
@@ -121,6 +121,10 @@ class Encoder(nn.Module):
             2, p.conv_ch, kernel_size=p.conv_kernel_inp, bias=False, separable=True
         )
         self.df_conv1 = conv_layer(fstride=2)
+        self.df_conv0_abs = Conv2dNormAct(
+            1, p.conv_ch, kernel_size=p.conv_kernel_inp, bias=False, separable=True
+        )
+        self.df_conv1_abs = conv_layer(fstride=2)
         self.erb_bins = p.nb_erb
         self.emb_in_dim = p.conv_ch * p.nb_erb // 4
         self.emb_dim = p.emb_hidden_dim
@@ -135,27 +139,13 @@ class Encoder(nn.Module):
         else:
             self.combine = Add()
         self.emb_n_layers = p.emb_num_layers
-        if p.emb_gru_skip_enc == "none":
-            skip_op = None
-        elif p.emb_gru_skip_enc == "identity":
-            assert self.emb_in_dim == self.emb_out_dim, "Dimensions do not match"
-            skip_op = partial(nn.Identity)
-        elif p.emb_gru_skip_enc == "groupedlinear":
-            skip_op = partial(
-                GroupedLinearEinsum,
-                input_size=self.emb_out_dim,
-                hidden_size=self.emb_out_dim,
-                groups=p.lin_groups,
-            )
-        else:
-            raise NotImplementedError()
         self.emb_gru = SqueezedGRU_S(
             self.emb_in_dim,
             self.emb_dim,
             output_size=self.emb_out_dim,
             num_layers=1,
             batch_first=True,
-            gru_skip_op=skip_op,
+            gru_skip_op=None,
             linear_groups=p.lin_groups,
             linear_act_layer=partial(nn.ReLU, inplace=True),
         )
@@ -164,7 +154,7 @@ class Encoder(nn.Module):
         self.lsnr_offset = p.lsnr_min
 
     def forward(
-        self, feat_erb: Tensor, feat_spec: Tensor
+        self, feat_erb: Tensor, feat_spec: Tensor, spp:Tensor
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         # Encodes erb; erb should be in dB scale + normalized; Fe are number of erb bands.
         # erb: [B, 1, T, Fe]
@@ -175,14 +165,24 @@ class Encoder(nn.Module):
         e2 = self.erb_conv2(e1)  # [B, C*4, T, F/4]
         e3 = self.erb_conv3(e2)  # [B, C*4, T, F/4]
         c0 = self.df_conv0(feat_spec)  # [B, C, T, Fc]
-        c1 = self.df_conv1(c0)  # [B, C*2, T, Fc/2]
+        c1 = self.df_conv1(c0)  # [B, C*2, T, Fc]
+        spp_shape = spp.shape
+        # print("deepfilter3 l-170 spp_shape",spp_shape)
+        # spp = torch.squeeze(spp)
+        ca1d = self.conv1d(spp)
+        # ca1d = ca1d.reshape(spp_shape[0],spp_shape[1],spp_shape[2],96)
+        ca0 = self.df_conv0_abs(ca1d)  # [B, C, T, Fc]
+        #print(spp.float())
+        ca1 = self.df_conv1_abs(ca0)  # [B, C*2, T, Fc]
         cemb = c1.permute(0, 2, 3, 1).flatten(2)  # [B, T, -1]
         cemb = self.df_fc_emb(cemb)  # [T, B, C * F/4]
-        emb = e3.permute(0, 2, 3, 1).flatten(2)  # [B, T, C * F]
-        emb = self.combine(emb, cemb)
+        cemb_abs = ca1.permute(0, 2, 3, 1).flatten(2)  # [B, T, -1]
+        cemb_abs = self.df_fc_emb(cemb_abs)  # [T, B, C * F/4]
+        emb = e3.permute(0, 2, 3, 1).flatten(2)  # [B, T, C * F/4]
+        emb = self.combine(emb, cemb, cemb_abs)
         emb, _ = self.emb_gru(emb)  # [B, T, -1]
         lsnr = self.lsnr_fc(emb) * self.lsnr_scale + self.lsnr_offset
-        return e0, e1, e2, e3, emb, c0, lsnr
+        return e0, e1, e2, e3, emb, c0, lsnr, ca0
 
 
 class ErbDecoder(nn.Module):
@@ -320,23 +320,23 @@ class DfDecoder(nn.Module):
         self.df_out = nn.Sequential(df_out, nn.Tanh())
         self.df_fc_a = nn.Sequential(nn.Linear(self.df_n_hidden, 1), nn.Sigmoid())
 
-    def forward(self, emb: Tensor, c0: Tensor) -> Tensor:
+    def forward(self, emb: Tensor, c0: Tensor, ca0:Tensor) -> Tuple[Tensor, Tensor]:
         b, t, _ = emb.shape
         c, _ = self.df_gru(emb)  # [B, T, H], H: df_n_hidden
         if self.df_skip is not None:
             c = c + self.df_skip(emb)
         c0 = self.df_convp(c0).permute(0, 2, 3, 1)  # [B, T, F, O*2], channels_last
+        ca0 = self.df_convp(ca0).permute(0, 2, 3, 1)  # [B, T, F, O*2], channels_last
+        alpha = self.df_fc_a(c)  # [B, T, 1]
         c = self.df_out(c)  # [B, T, F*O*2], O: df_order
-        c = c.view(b, t, self.df_bins, self.df_out_ch) + c0  # [B, T, F, O*2]
-        return c
+        c = c.view(b, t, self.df_bins, self.df_out_ch) + c0 +ca0  # [B, T, F, O*2]
+        return c, alpha
 
 
 class DfNet(nn.Module):
     run_df: Final[bool]
     run_erb: Final[bool]
     lsnr_droput: Final[bool]
-    post_filter: Final[bool]
-    post_filter_beta: Final[float]
 
     def __init__(
         self,
@@ -355,7 +355,7 @@ class DfNet(nn.Module):
         self.emb_dim: int = layer_width * p.nb_erb
         self.erb_bins: int = p.nb_erb
         if p.conv_lookahead > 0:
-            assert p.conv_lookahead >= p.df_lookahead
+            assert p.conv_lookahead == p.df_lookahead
             self.pad_feat = nn.ConstantPad2d((0, 0, -p.conv_lookahead, p.conv_lookahead), 0.0)
         else:
             self.pad_feat = nn.Identity()
@@ -366,10 +366,7 @@ class DfNet(nn.Module):
         self.register_buffer("erb_fb", erb_fb)
         self.enc = Encoder()
         self.erb_dec = ErbDecoder()
-        self.mask = Mask(erb_inv_fb)
-        self.erb_inv_fb = erb_inv_fb
-        self.post_filter = p.mask_pf
-        self.post_filter_beta = p.pf_beta
+        self.mask = Mask(erb_inv_fb, post_filter=p.mask_pf)
 
         self.df_order = p.df_order
         self.df_op = MF.DF(num_freqs=p.nb_df, frame_size=p.df_order, lookahead=self.df_lookahead)
@@ -391,6 +388,7 @@ class DfNet(nn.Module):
         spec: Tensor,
         feat_erb: Tensor,
         feat_spec: Tensor,  # Not used, take spec modified by mask instead
+        spp:Tensor
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Forward method of DeepFilterNet2.
 
@@ -405,10 +403,10 @@ class DfNet(nn.Module):
             lsnr (Tensor): Local SNR estimate of shape [B, T, 1]
         """
         feat_spec = feat_spec.squeeze(1).permute(0, 3, 1, 2)
-
+        spp = self.pad_feat(spp)
         feat_erb = self.pad_feat(feat_erb)
         feat_spec = self.pad_feat(feat_spec)
-        e0, e1, e2, e3, emb, c0, lsnr = self.enc(feat_erb, feat_spec)
+        e0, e1, e2, e3, emb, c0, lsnr, ca0 = self.enc(feat_erb, feat_spec, spp)
 
         if self.lsnr_droput:
             idcs = lsnr.squeeze() > -10.0
@@ -422,6 +420,7 @@ class DfNet(nn.Module):
             e2 = e2[:, :, idcs]
             e3 = e3[:, :, idcs]
             c0 = c0[:, :, idcs]
+            ca0 = ca0[:, :, idcs]
 
         if self.run_erb:
             if self.lsnr_droput:
@@ -435,22 +434,14 @@ class DfNet(nn.Module):
 
         if self.run_df:
             if self.lsnr_droput:
-                df_coefs[:, idcs] = self.df_dec(emb, c0)
+                df_coefs[:, idcs] = self.df_dec(emb, c0, ca0)[0]
             else:
-                df_coefs = self.df_dec(emb, c0)
+                df_coefs = self.df_dec(emb, c0, ca0)[0]
             df_coefs = self.df_out_transform(df_coefs)
-            spec_e = self.df_op(spec.clone(), df_coefs)
-            spec_e[..., self.nb_df :, :] = spec_m[..., self.nb_df :, :]
+            spec = self.df_op(spec, df_coefs)
+            spec[..., self.nb_df :, :] = spec_m[..., self.nb_df :, :]
         else:
             df_coefs = torch.zeros((), device=spec.device)
-            spec_e = spec_m
+            spec = spec_m
 
-        if self.post_filter:
-            beta = self.post_filter_beta
-            eps = 1e-12
-            mask = (as_complex(spec_e).abs() / as_complex(spec).abs().add(eps)).clamp(eps, 1)
-            mask_sin = mask * torch.sin(PI * mask / 2).clamp_min(eps)
-            pf = (1 + beta) / (1 + beta * mask.div(mask_sin).pow(2))
-            spec_e = spec_e * pf.unsqueeze(-1)
-
-        return spec_e, m, lsnr, df_coefs
+        return spec, m, lsnr, df_coefs
